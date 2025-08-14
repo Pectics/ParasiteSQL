@@ -1,0 +1,40 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'me.pectics.parasitesql'
+version = '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass = 'me.pectics.parasitesql.Launcher'
+}
+
+dependencies {
+    runtimeOnly("org.slf4j:slf4j-simple:2.0.13")
+
+    implementation 'ch.vorburger.mariaDB4j:mariaDB4j:latest.release'
+    implementation 'org.mariadb.jdbc:mariadb-java-client:latest.release'
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21) // 用你的容器 JVM 版本
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+test {
+    useJUnitPlatform()
+}
