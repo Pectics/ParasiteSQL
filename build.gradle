@@ -16,9 +16,13 @@ application {
 }
 
 dependencies {
+    implementation 'org.projectlombok:lombok:1.18.38'
+    annotationProcessor 'org.projectlombok:lombok:1.18.38'
+
     compileOnly 'org.jetbrains:annotations:24.1.0'
 
     runtimeOnly 'org.slf4j:slf4j-simple:2.0.13'
+    implementation 'ch.qos.logback:logback-classic:1.5.18'
 
     implementation 'ch.vorburger.mariaDB4j:mariaDB4j:latest.release'
     implementation 'org.mariadb.jdbc:mariadb-java-client:latest.release'

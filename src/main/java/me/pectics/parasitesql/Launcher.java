@@ -2,6 +2,7 @@ package me.pectics.parasitesql;
 
 import ch.vorburger.mariadb4j.DB;
 import ch.vorburger.mariadb4j.DBConfigurationBuilder;
+import lombok.extern.slf4j.Slf4j;
 import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.NotNull;
 
@@ -9,10 +10,15 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.sql.*;
+import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.Date;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
+@Slf4j
 public class Launcher {
 
     // ========= 停机协调（Pterodactyl stop + SIGTERM） =========
@@ -29,7 +35,7 @@ public class Launcher {
     }
 
     private static void startStdinStopWatcher(DB db) {
-        // 仅用于“面板 Stop”这种直接打一个 stop\n 的情况；REPL 自己也会识别关键词
+        // 仅用于“面板 Stop”这种直接打一个 stop\n 的情况
         Thread t = new Thread(() -> {
             try (BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
                 String line;
@@ -66,7 +72,6 @@ public class Launcher {
         int bufferPoolMb;                // >=32
         Path baseDir;                    // base
         Path dataDir;                    // data
-        boolean enableRepl;              // 启动 SQL REPL
 
         @NotNull Properties toProperties() {
             Properties p = new Properties();
@@ -79,7 +84,6 @@ public class Launcher {
             p.setProperty("bufferPoolMb", String.valueOf(bufferPoolMb));
             p.setProperty("baseDir", baseDir.toString());
             p.setProperty("dataDir", dataDir.toString());
-            p.setProperty("repl", String.valueOf(enableRepl));
             return p;
         }
 
@@ -96,7 +100,6 @@ public class Launcher {
             int dBPMb = getInt(System.getProperty("db.bufferPoolMb"), getInt(fileProps.getProperty("bufferPoolMb"), 128));
             Path dBase = Paths.get(or(System.getProperty("db.base"), fileProps.getProperty("baseDir"), "./mariadb_base"));
             Path dData = Paths.get(or(System.getProperty("db.data"), fileProps.getProperty("dataDir"), "./mariadb_data"));
-            boolean dRepl = getBool(System.getProperty("db.repl"), getBool(fileProps.getProperty("repl"), true));
 
             // 交互式确认/修改
             BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
@@ -115,7 +118,6 @@ public class Launcher {
             c.bufferPoolMb = askInt(br, "InnoDB buffer pool (MB)", dBPMb, 32, 1_048_576);
             c.baseDir = askPath(br, "Base dir", dBase);
             c.dataDir = askPath(br, "Data dir", dData);
-            c.enableRepl = askBool(br, dRepl);
 
             Files.createDirectories(c.baseDir);
             Files.createDirectories(c.dataDir);
@@ -123,7 +125,7 @@ public class Launcher {
             System.out.println("=== Config Summary ===");
             System.out.printf(Locale.ROOT, "Port=%d, Bind=%s, RemoteRootHost=%s%n", c.port, c.bind, c.remoteRootHost.isBlank() ? "<disabled>" : c.remoteRootHost);
             System.out.printf(Locale.ROOT, "Charset=%s, Collation=%s, BufferPool=%dMB%n", c.charset, c.collation, c.bufferPoolMb);
-            System.out.printf(Locale.ROOT, "BaseDir=%s%nDataDir=%s%nREPL=%s%n", c.baseDir.toAbsolutePath(), c.dataDir.toAbsolutePath(), c.enableRepl);
+            System.out.printf(Locale.ROOT, "BaseDir=%s%nDataDir=%s%n", c.baseDir.toAbsolutePath(), c.dataDir.toAbsolutePath());
 
             return c;
         }
@@ -166,18 +168,6 @@ public class Launcher {
                 s = s.trim();
                 if (ok.test(s)) return s;
                 System.out.println("Invalid input.");
-            }
-        }
-
-        private static boolean askBool(@NotNull BufferedReader br, boolean def) throws IOException {
-            while (true) {
-                System.out.printf("%s [%s] (y/n):\n", "Enable SQL REPL", def ? "Y" : "N");
-                String s = br.readLine();
-                if (s == null || s.isBlank()) return def;
-                s = s.trim().toLowerCase(Locale.ROOT);
-                if (s.equals("y") || s.equals("yes") || s.equals("true")) return true;
-                if (s.equals("n") || s.equals("no") || s.equals("false")) return false;
-                System.out.println("Please answer y/n.");
             }
         }
 
@@ -230,8 +220,32 @@ public class Launcher {
         }
     }
 
+    public static void addLogArchiverHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                Path logFile = Paths.get("logs/latest.log");
+                if (Files.exists(logFile)) {
+                    String ts = new SimpleDateFormat("yyyy-MM-dd-HH-mm-ss").format(new Date());
+                    Path zipFile = Paths.get("logs", ts + ".zip");
+
+                    try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zipFile));
+                         InputStream in = Files.newInputStream(logFile)) {
+                        zos.putNextEntry(new ZipEntry("latest.log"));
+                        in.transferTo(zos);
+                        zos.closeEntry();
+                    }
+                    System.out.println("[LOG] Archived to " + zipFile);
+                }
+            } catch (IOException e) {
+                log.warn("Failed to archive logs: {}", e.getMessage());
+            }
+        }));
+    }
+
     // ========= 主流程 =========
     public static void main(String[] args) throws Exception {
+        addLogArchiverHook();
+
         Path cfgPath = Paths.get(CFG_FILE);
         Properties fileProps = loadCfgFile(cfgPath);
         Cfg cfg = Cfg.from(fileProps);

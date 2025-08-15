@@ -1,0 +1,31 @@
+<configuration>
+
+    <!-- 注册自定义 Level 转换器 -->
+    <conversionRule conversionWord="abbrLevel"
+                    converterClass="me.pectics.parasitesql.AbbrLevelConverter"/>
+
+    <!-- 定义控制台输出模式 -->
+    <property name="CONSOLE_PATTERN" value="%d{HH:mm:ss.SSS} [%thread] [%abbrLevel] %msg%n" />
+
+    <!-- 控制台 appender -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 文件 appender -->
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>logs/latest.log</file>
+        <append>false</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%abbrLevel] %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="debug">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+    </root>
+
+</configuration>
