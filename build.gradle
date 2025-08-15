@@ -16,13 +16,12 @@ application {
 }
 
 dependencies {
-    runtimeOnly("org.slf4j:slf4j-simple:2.0.13")
+    compileOnly 'org.jetbrains:annotations:24.1.0'
+
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.13'
 
     implementation 'ch.vorburger.mariaDB4j:mariaDB4j:latest.release'
     implementation 'org.mariadb.jdbc:mariadb-java-client:latest.release'
-
-    testImplementation platform('org.junit:junit-bom:5.10.0')
-    testImplementation 'org.junit.jupiter:junit-jupiter'
 }
 
 java {
@@ -33,8 +32,4 @@ java {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
-}
-
-test {
-    useJUnitPlatform()
 }

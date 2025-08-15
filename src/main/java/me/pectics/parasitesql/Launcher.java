@@ -2,29 +2,22 @@ package me.pectics.parasitesql;
 
 import ch.vorburger.mariadb4j.DB;
 import ch.vorburger.mariadb4j.DBConfigurationBuilder;
+import org.jetbrains.annotations.Contract;
+import org.jetbrains.annotations.NotNull;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.Statement;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.sql.*;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * ParasiteSQL: run MariaDB inside a Pterodactyl MC container via MariaDB4j.
- * Requirements from user:
- * 1) Only ONE public port; read it from -Ddb.port, else prompt at startup.
- * 2) Provide root remote access with default password qwerty123456.
- * 3) Do NOT create any extra users or databases other than root.
- */
 public class Launcher {
 
-    // Graceful stop coordination for Pterodactyl "stop" (stdin) + SIGTERM
-    private static final java.util.concurrent.CountDownLatch QUIT = new java.util.concurrent.CountDownLatch(1);
-    private static final java.util.concurrent.atomic.AtomicBoolean STOPPING = new java.util.concurrent.atomic.AtomicBoolean(false);
+    // ========= 停机协调（Pterodactyl stop + SIGTERM） =========
+    private static final CountDownLatch QUIT = new CountDownLatch(1);
+    private static final AtomicBoolean STOPPING = new AtomicBoolean(false);
 
     private static void gracefulStop(DB db) {
         if (db == null) return;
@@ -35,20 +28,20 @@ public class Launcher {
         }
     }
 
-    private static void startStdinWatcher(DB db) {
+    private static void startStdinStopWatcher(DB db) {
+        // 仅用于“面板 Stop”这种直接打一个 stop\n 的情况；REPL 自己也会识别关键词
         Thread t = new Thread(() -> {
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(System.in))) {
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = br.readLine()) != null) {
-                    String cmd = line.trim().toLowerCase();
-                    if (cmd.equals("stop") || cmd.equals("shutdown") || cmd.equals("end") || cmd.equals("quit") || cmd.equals("exit")) {
+                    String cmd = line.trim().toLowerCase(Locale.ROOT);
+                    if (isStopCommand(cmd)) {
                         gracefulStop(db);
                         break;
                     }
                 }
             } catch (IOException ignored) {
             } finally {
-                // stdin closed unexpectedly -> also stop
                 gracefulStop(db);
             }
         }, "stdin-stop-watcher");
@@ -56,83 +49,375 @@ public class Launcher {
         t.start();
     }
 
-    private static int readPortInteractive() throws IOException {
-        BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
-        while (true) {
-            System.out.print("Enter DB port (e.g. 3306): ");
-            String line = br.readLine();
-            if (line == null) continue; // keep waiting if stdin not ready
-            line = line.trim();
-            try {
-                int p = Integer.parseInt(line);
-                if (p > 0 && p < 65536) return p;
-            } catch (NumberFormatException ignored) {}
-            System.out.println("Invalid port. Try again.");
+    private static boolean isStopCommand(@NotNull String s) {
+        return s.equals("stop") || s.equals("shutdown") || s.equals("quit") || s.equals("exit") || s.equals("end");
+    }
+
+    // ========= 配置 =========
+    private static final String CFG_FILE = "parasitesql.properties";
+
+    private static final class Cfg {
+        int port;                        // 1..65535
+        String bind;                     // 0.0.0.0 / 127.0.0.1 / IP
+        String remoteRootHost;           // '%' or '10.0.0.%' or ''(禁用)
+        String rootPwd;                  // non-empty
+        String charset;                  // utf8mb4
+        String collation;                // utf8mb4_unicode_ci
+        int bufferPoolMb;                // >=32
+        Path baseDir;                    // base
+        Path dataDir;                    // data
+        boolean enableRepl;              // 启动 SQL REPL
+
+        @NotNull Properties toProperties() {
+            Properties p = new Properties();
+            p.setProperty("port", String.valueOf(port));
+            p.setProperty("bind", bind);
+            p.setProperty("remoteRootHost", remoteRootHost);
+            p.setProperty("rootPwd", rootPwd);
+            p.setProperty("charset", charset);
+            p.setProperty("collation", collation);
+            p.setProperty("bufferPoolMb", String.valueOf(bufferPoolMb));
+            p.setProperty("baseDir", baseDir.toString());
+            p.setProperty("dataDir", dataDir.toString());
+            p.setProperty("repl", String.valueOf(enableRepl));
+            return p;
+        }
+
+        static @NotNull Cfg from(@NotNull Properties fileProps) throws IOException {
+            Cfg c = new Cfg();
+            // 默认值
+            int dPort = getInt(System.getProperty("db.port"), getInt(fileProps.getProperty("port"), 3306));
+            String dBind = or(System.getProperty("db.bind"), fileProps.getProperty("bind"), "0.0.0.0");
+            String dRemote = or(System.getProperty("db.remoteRootHost"), fileProps.getProperty("remoteRootHost"), "%"); // '%' 表示允许任意远程
+            String dPwd = or(System.getProperty("db.root"), fileProps.getProperty("rootPwd"),
+                    UUID.randomUUID().toString().replace("-", "").substring(0, 8));
+            String dCharset = or(System.getProperty("db.charset"), fileProps.getProperty("charset"), "utf8mb4");
+            String dColl = or(System.getProperty("db.collation"), fileProps.getProperty("collation"), "utf8mb4_unicode_ci");
+            int dBPMb = getInt(System.getProperty("db.bufferPoolMb"), getInt(fileProps.getProperty("bufferPoolMb"), 128));
+            Path dBase = Paths.get(or(System.getProperty("db.base"), fileProps.getProperty("baseDir"), "./mariadb_base"));
+            Path dData = Paths.get(or(System.getProperty("db.data"), fileProps.getProperty("dataDir"), "./mariadb_data"));
+            boolean dRepl = getBool(System.getProperty("db.repl"), getBool(fileProps.getProperty("repl"), true));
+
+            // 交互式确认/修改
+            BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+            System.out.println("=== ParasiteSQL Interactive Setup ===  (ENTER 使用默认)");
+            c.port = askInt(br, "DB port", dPort, 1, 65535);
+            c.bind = askStr(br, "Bind address (0.0.0.0/127.0.0.1/IP)", dBind, s -> !s.isBlank());
+
+            // 远程 root：留空 = 禁用，'%' = 任意远程，或 10.0.0.% 这种网段
+            String hostHint = dRemote.isBlank() ? "(empty to DISABLE)" : dRemote;
+            c.remoteRootHost = askStr(br, "Remote root host ('%', '10.0.0.%' or empty to disable)", hostHint, s -> true).trim();
+            if (c.remoteRootHost.equalsIgnoreCase("(empty to DISABLE)")) c.remoteRootHost = dRemote; // 处理 hint 回车
+
+            c.rootPwd = askPassword(dPwd);
+            c.charset = askStr(br, "Character set", dCharset, s -> !s.isBlank());
+            c.collation = askStr(br, "Collation", dColl, s -> !s.isBlank());
+            c.bufferPoolMb = askInt(br, "InnoDB buffer pool (MB)", dBPMb, 32, 1_048_576);
+            c.baseDir = askPath(br, "Base dir", dBase);
+            c.dataDir = askPath(br, "Data dir", dData);
+            c.enableRepl = askBool(br, dRepl);
+
+            Files.createDirectories(c.baseDir);
+            Files.createDirectories(c.dataDir);
+
+            System.out.println("=== Config Summary ===");
+            System.out.printf(Locale.ROOT, "Port=%d, Bind=%s, RemoteRootHost=%s%n", c.port, c.bind, c.remoteRootHost.isBlank() ? "<disabled>" : c.remoteRootHost);
+            System.out.printf(Locale.ROOT, "Charset=%s, Collation=%s, BufferPool=%dMB%n", c.charset, c.collation, c.bufferPoolMb);
+            System.out.printf(Locale.ROOT, "BaseDir=%s%nDataDir=%s%nREPL=%s%n", c.baseDir.toAbsolutePath(), c.dataDir.toAbsolutePath(), c.enableRepl);
+
+            return c;
+        }
+
+        @Contract(pure = true)
+        private static @NotNull String or(String @NotNull ... v) {
+            for (String s : v) if (s != null && !s.isBlank()) return s;
+            return "";
+        }
+
+        private static int getInt(String v, int def) {
+            if (v == null || v.isBlank()) return def;
+            try { return Integer.parseInt(v.trim()); } catch (Exception e) { return def; }
+        }
+
+        private static boolean getBool(String v, boolean def) {
+            if (v == null || v.isBlank()) return def;
+            String s = v.trim().toLowerCase(Locale.ROOT);
+            return s.equals("1") || s.equals("true") || s.equals("yes") || s.equals("y");
+        }
+
+        private static int askInt(@NotNull BufferedReader br, String title, int def, int min, int max) throws IOException {
+            while (true) {
+                System.out.printf(Locale.ROOT, "%s [%d]:\n", title, def);
+                String s = br.readLine();
+                if (s == null || s.isBlank()) return def;
+                try {
+                    int x = Integer.parseInt(s.trim());
+                    if (x >= min && x <= max) return x;
+                } catch (NumberFormatException ignore) {}
+                System.out.println("Invalid number.");
+            }
+        }
+
+        private static String askStr(@NotNull BufferedReader br, String title, String def, java.util.function.Predicate<String> ok) throws IOException {
+            while (true) {
+                System.out.printf("%s [%s]:\n", title, def);
+                String s = br.readLine();
+                if (s == null || s.isBlank()) return def;
+                s = s.trim();
+                if (ok.test(s)) return s;
+                System.out.println("Invalid input.");
+            }
+        }
+
+        private static boolean askBool(@NotNull BufferedReader br, boolean def) throws IOException {
+            while (true) {
+                System.out.printf("%s [%s] (y/n):\n", "Enable SQL REPL", def ? "Y" : "N");
+                String s = br.readLine();
+                if (s == null || s.isBlank()) return def;
+                s = s.trim().toLowerCase(Locale.ROOT);
+                if (s.equals("y") || s.equals("yes") || s.equals("true")) return true;
+                if (s.equals("n") || s.equals("no") || s.equals("false")) return false;
+                System.out.println("Please answer y/n.");
+            }
+        }
+
+        private static Path askPath(@NotNull BufferedReader br, String title, Path def) throws IOException {
+            while (true) {
+                System.out.printf("%s [%s]:\n", title, def);
+                String s = br.readLine();
+                if (s == null || s.isBlank()) return def;
+                Path p = Paths.get(s.trim());
+                try {
+                    Files.createDirectories(p);
+                    return p;
+                } catch (Exception e) {
+                    System.out.println("Cannot create/access path: " + e.getMessage());
+                }
+            }
+        }
+
+        private static String askPassword(String def) throws IOException {
+            Console cn = System.console();
+            if (cn != null) {
+                char[] pw = cn.readPassword("%s [%s]:\n", "Root password", def);
+                return (pw == null || pw.length == 0) ? def : new String(pw);
+            }
+            BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+            System.out.printf("%s [%s]: ", "Root password", def);
+            String s = br.readLine();
+            return (s == null || s.isBlank()) ? def : s.trim();
         }
     }
 
-    public static void main(String[] args) throws Exception {
-        // 1) Resolve port from -Ddb.port or interactive prompt
-        int port;
-        String prop = System.getProperty("db.port");
-        if (prop != null && !prop.isBlank()) {
-            port = Integer.parseInt(prop.trim());
-        } else {
-            port = readPortInteractive();
+    private static @NotNull Properties loadCfgFile(Path file) {
+        Properties p = new Properties();
+        if (Files.isReadable(file)) {
+            try (InputStream in = Files.newInputStream(file)) {
+                p.load(in);
+            } catch (Exception e) {
+                System.err.println("[WARN] Failed to read " + file + ": " + e.getMessage());
+            }
         }
+        return p;
+    }
 
-        // 2) Prepare dirs under Pterodactyl persistent work dir
-        Path baseDir = Paths.get("./mariadb_base");
-        Path dataDir = Paths.get("./mariadb_data");
-        Files.createDirectories(baseDir);
-        Files.createDirectories(dataDir);
+    private static void saveCfgFile(Path file, Properties p) {
+        try (OutputStream out = Files.newOutputStream(file, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            p.store(out, "ParasiteSQL persisted config");
+            System.out.println("[CONF] Saved to " + file.toAbsolutePath());
+        } catch (Exception e) {
+            System.err.println("[WARN] Failed to save config: " + e.getMessage());
+        }
+    }
 
-        // 3) Build MariaDB4j config (no skip-grant-tables; bind to 0.0.0.0)
-        DBConfigurationBuilder cfg = DBConfigurationBuilder.newBuilder();
-        cfg.setPort(port);
-        cfg.setBaseDir(baseDir.toFile());
-        cfg.setDataDir(dataDir.toFile());
-        cfg.setSecurityDisabled(false); // critical: enable grants
-        cfg.addArg("--bind-address=0.0.0.0");
-        cfg.addArg("--character-set-server=utf8mb4");
-        cfg.addArg("--collation-server=utf8mb4_unicode_ci");
-        // keep memory modest; adjust if you have more
-        cfg.addArg("--innodb-buffer-pool-size=128M");
+    // ========= 主流程 =========
+    public static void main(String[] args) throws Exception {
+        Path cfgPath = Paths.get(CFG_FILE);
+        Properties fileProps = loadCfgFile(cfgPath);
+        Cfg cfg = Cfg.from(fileProps);
 
-        // 4) Create idempotent init SQL to set root password & remote root. No extra DB/users.
-        String rootPwd = System.getProperty("db.root", "qwerty123456");
-        Path initFile = Paths.get("./init.sql");
-        String initSql = String.join("\n",
-                "-- Idempotent root setup; NO extra DB or users",
-                "ALTER USER 'root'@'localhost' IDENTIFIED BY '" + rootPwd + "';",
-                "CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '" + rootPwd + "';",
-                "GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;",
-                "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;",
-                "FLUSH PRIVILEGES;"
-        );
-        Files.writeString(initFile, initSql);
-        cfg.addArg("--init-file=" + initFile.toAbsolutePath());
+        // —— 构建 MariaDB4j 配置 —— //
+        DBConfigurationBuilder b = DBConfigurationBuilder.newBuilder();
+        b.setPort(cfg.port);
+        b.setBaseDir(cfg.baseDir.toFile());
+        b.setDataDir(cfg.dataDir.toFile());
+        b.setSecurityDisabled(false);
 
-        // 5) Start DB (will download binaries on first run if internet is available)
-        DB db = DB.newEmbeddedDB(cfg.build());
+        b.addArg("--bind-address=" + cfg.bind);
+        b.addArg("--skip-name-resolve");
+        b.addArg("--character-set-server=" + cfg.charset);
+        b.addArg("--collation-server=" + cfg.collation);
+        b.addArg("--innodb-buffer-pool-size=" + cfg.bufferPoolMb + "M");
+        b.addArg("--innodb-file-per-table=1");
+
+        // —— 生成 init-file：仅配置 root（localhost + 远程可选） —— //
+        String rootPwdEsc = cfg.rootPwd.replace("'", "''");
+        StringBuilder init = new StringBuilder();
+        init.append("-- Idempotent root setup; NO extra DB/users\n");
+        init.append("CREATE USER IF NOT EXISTS 'root'@'localhost' IDENTIFIED BY '").append(rootPwdEsc).append("';\n");
+        init.append("ALTER USER 'root'@'localhost' IDENTIFIED BY '").append(rootPwdEsc).append("';\n");
+        init.append("GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION;\n");
+        if (!cfg.remoteRootHost.isBlank()) {
+            init.append("CREATE USER IF NOT EXISTS 'root'@'").append(cfg.remoteRootHost).append("' IDENTIFIED BY '").append(rootPwdEsc).append("';\n");
+            init.append("ALTER USER 'root'@'").append(cfg.remoteRootHost).append("' IDENTIFIED BY '").append(rootPwdEsc).append("';\n");
+            init.append("GRANT ALL PRIVILEGES ON *.* TO 'root'@'").append(cfg.remoteRootHost).append("' WITH GRANT OPTION;\n");
+        } else {
+            // 若之前存在远程 root，则锁定
+            init.append("ALTER USER IF EXISTS 'root'@'%' ACCOUNT LOCK;\n");
+        }
+        init.append("FLUSH PRIVILEGES;\n");
+
+        Path initFile = cfg.baseDir.resolve("init_root.sql").toAbsolutePath();
+        Files.createDirectories(initFile.getParent());
+        Files.writeString(initFile, init.toString(), StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        b.addArg("--init-file=" + initFile);
+
+        // —— 启动 MariaDB —— //
+        DB db = DB.newEmbeddedDB(b.build());
         db.start();
 
-        // 6) Quick probe using configured root credentials (connect locally)
-        try (Connection c = DriverManager.getConnection(
-                "jdbc:mariadb://127.0.0.1:" + port + "/", "root", rootPwd);
+        // —— 保存配置文件（成功启动后再持久化） —— //
+        saveCfgFile(cfgPath, cfg.toProperties());
+
+        // —— 探活 —— //
+        String jdbcUrl = "jdbc:mariadb://127.0.0.1:" + cfg.port + "/?useUnicode=true&characterEncoding=" + cfg.charset;
+        try (Connection c = DriverManager.getConnection(jdbcUrl, "root", cfg.rootPwd);
              Statement s = c.createStatement()) {
             s.execute("SELECT 1");
-            System.out.println("[OK] MariaDB is up on 0.0.0.0:" + port + ", root password set.");
+            System.out.printf(Locale.ROOT, "[OK] MariaDB up on %s:%d; root configured.%n", cfg.bind, cfg.port);
         } catch (Exception e) {
             System.err.println("[WARN] Local root probe failed: " + e.getMessage());
         }
 
-        // 7) Hook panel stop via stdin + add shutdown hook for SIGTERM; then wait
-        startStdinWatcher(db);
+        // —— 停机钩子 —— //
+        startStdinStopWatcher(db);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> gracefulStop(db)));
-        System.out.println("[READY] MariaDB listening. Type 'stop' here or use panel Stop to shutdown.");
+
+        // —— SQL REPL —— //
+        if (cfg.enableRepl) {
+            try (Connection conn = DriverManager.getConnection(jdbcUrl, "root", cfg.rootPwd)) {
+                conn.setAutoCommit(true);
+                System.out.println("[READY] SQL REPL enabled. Enter SQL and end with ';'. Type stop/quit/exit to shutdown.");
+                runSqlRepl(conn, db);
+            }
+        } else {
+            System.out.println("[READY] MariaDB listening. Type 'stop' here or use panel Stop to shutdown.");
+            QUIT.await();
+        }
+
+        System.out.println("[EXIT] MariaDB stopped. Bye.");
+    }
+
+    // ========= SQL REPL =========
+    private static void runSqlRepl(Connection conn, DB db) throws Exception {
+        BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        StringBuilder buf = new StringBuilder();
+        while (true) {
+            if (STOPPING.get()) break;
+
+            System.out.print(buf.isEmpty() ? "sql> " : "  -> ");
+            String line = br.readLine();
+            if (line == null) { // stdin 关闭
+                gracefulStop(db);
+                break;
+            }
+            String trimmed = line.trim();
+            if (buf.isEmpty() && isStopCommand(trimmed.toLowerCase(Locale.ROOT))) {
+                gracefulStop(db);
+                break;
+            }
+            // 支持空行 / 注释跳过
+            if (trimmed.isEmpty()) continue;
+
+            buf.append(line).append('\n');
+
+            // 仅在遇到分号结尾时执行（简单切分，不处理引号内分号等高级场景）
+            if (trimmed.endsWith(";")) {
+                String sqlBlock = buf.toString().trim();
+                buf.setLength(0);
+                // 去掉最后一个 ';'
+                if (sqlBlock.endsWith(";")) sqlBlock = sqlBlock.substring(0, sqlBlock.length() - 1).trim();
+                if (sqlBlock.isEmpty()) continue;
+
+                long t0 = System.currentTimeMillis();
+                try (Statement st = conn.createStatement()) {
+                    boolean hasResult = st.execute(sqlBlock);
+                    long cost = System.currentTimeMillis() - t0;
+                    if (hasResult) {
+                        try (ResultSet rs = st.getResultSet()) {
+                            printResultSet(rs); // 最多打印 200 行，防止刷屏
+                        }
+                        System.out.printf(Locale.ROOT, "[OK] Query done in %d ms%n", cost);
+                    } else {
+                        int upd = st.getUpdateCount();
+                        System.out.printf(Locale.ROOT, "[OK] %d row(s) affected in %d ms%n", Math.max(upd, 0), cost);
+                    }
+                } catch (SQLException e) {
+                    System.err.println("[SQL-ERR] " + e.getMessage());
+                }
+            }
+        }
         QUIT.await();
-        System.out.println("[EXIT] MariaDB stopped. Goodbye.");
+    }
+
+    private static void printResultSet(@NotNull ResultSet rs) throws SQLException {
+        ResultSetMetaData md = rs.getMetaData();
+        int cols = md.getColumnCount();
+        List<String[]> rows = new ArrayList<>();
+        String[] header = new String[cols];
+        int[] width = new int[cols];
+        for (int i = 1; i <= cols; i++) {
+            header[i - 1] = md.getColumnLabel(i);
+            width[i - 1] = header[i - 1].length();
+        }
+        int count = 0;
+        while (rs.next()) {
+            if (count >= 200) { break; }
+            String[] row = new String[cols];
+            for (int i = 1; i <= cols; i++) {
+                String v = rs.getString(i);
+                if (v == null) v = "NULL";
+                // 限制单元格展示长度，避免爆屏
+                if (v.length() > 200) v = v.substring(0, 200) + "...";
+                row[i - 1] = v;
+                width[i - 1] = Math.max(width[i - 1], v.length());
+            }
+            rows.add(row);
+            count++;
+        }
+
+        // 打印表格
+        printRow(header, width, true);
+        for (String[] r : rows) printRow(r, width, false);
+        if (!rs.isAfterLast()) {
+            System.out.printf("[TRUNCATED] Only first %d row(s) shown.%n", 200);
+        }
+    }
+
+    private static void printRow(String @NotNull [] row, int[] width, boolean header) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < row.length; i++) {
+            String cell = row[i] == null ? "" : row[i];
+            sb.append(pad(cell, width[i]));
+            if (i < row.length - 1) sb.append(" | ");
+        }
+        System.out.println(sb);
+        if (header) {
+            StringBuilder sep = new StringBuilder();
+            for (int i = 0; i < row.length; i++) {
+                sep.append("-".repeat(Math.max(1, width[i])));
+                if (i < row.length - 1) sep.append("-+-");
+            }
+            System.out.println(sep);
+        }
+    }
+
+    @NotNull
+    private static String pad(@NotNull String s, int w) {
+        if (s.length() >= w) return s;
+        StringBuilder sb = new StringBuilder(s);
+        while (sb.length() < w) sb.append(' ');
+        return sb.toString();
     }
 
 }
